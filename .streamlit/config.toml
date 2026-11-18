@@ -1,0 +1,10 @@
+
+[server]
+maxUploadSize = 10
+
+[client]
+toolbarMode = "viewer"
+
+[theme]
+base = "light"
+primaryColor = "#b2182b"
