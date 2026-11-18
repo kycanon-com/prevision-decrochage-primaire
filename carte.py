@@ -8,7 +8,7 @@ import re
 
 import numpy as np
 
-FS = 10.2                     # taille des noms (px dans le repere 800 x 586)
+FS = 11.0                     # taille des noms (px dans le repere 800 x 586)
 LARGEUR_CAR = 0.50            # largeur moyenne d'un caractere, en fraction de la taille
 
 
@@ -83,3 +83,39 @@ def positions_etiquettes(carte, noms):
             break
     return {c: (float(pos[c][0]), float(pos[c][1]), float(ancres[c][0]), float(ancres[c][1]),
                 bool(np.hypot(*(pos[c] - ancres[c])) > 9)) for c in codes}
+
+
+def contours_regions(carte, region_par_code, echelle=4):
+    """Contour de chaque region = union de ses provinces, obtenu par une grille fine (matplotlib, PIL).
+
+    Renvoie {region: {"path": "M...Z", "x": cx, "y": cy}} ; (x, y) est le centre de la region, pour son etiquette.
+    """
+    from PIL import Image, ImageDraw
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    L, H = int(carte["largeur"]), int(carte["hauteur"])
+    par_region = {}
+    for code, geo in carte["provinces"].items():
+        par_region.setdefault(region_par_code[code], []).append(geo["path"])
+    sortie = {}
+    for region, chemins in par_region.items():
+        img = Image.new("L", (L * echelle, H * echelle), 0)
+        dessin = ImageDraw.Draw(img)
+        for chemin in chemins:
+            for anneau in _anneaux(chemin):
+                dessin.polygon([(x * echelle, y * echelle) for x, y in anneau], fill=255)
+        masque = np.array(img, dtype=float) / 255.0
+        fig, ax = plt.subplots()
+        segments = ax.contour(masque, levels=[0.5]).allsegs[0]
+        plt.close(fig)
+        morceaux = []
+        for seg in segments:
+            if len(seg) < 4:
+                continue
+            pts = np.round(seg / echelle, 1)
+            morceaux.append("M" + "L".join(f"{x:g},{y:g}" for x, y in pts[::2]) + "Z")
+        ys, xs = np.nonzero(masque > 0.5)
+        sortie[region] = {"path": "".join(morceaux), "x": round(float(xs.mean()) / echelle, 1),
+                          "y": round(float(ys.mean()) / echelle, 1)}
+    return sortie
