@@ -39,13 +39,14 @@ LIBELLES_NOYAU = {
 }
 
 DIMENSIONS = {
-    "D1_abandon": {"poids": 0.35, "libelle": "Abandon en cours de cycle",
+    "D1_abandon": {"poids": 0.375, "libelle": "Abandon en cours de cycle",
                    "vars": ["taux_abandon", "taux_abandon_moy3"]},
-    "D2_exclusion": {"poids": 0.475, "libelle": "Exclusion scolaire et non-achèvement",
+    "D2_exclusion": {"poids": 0.35, "libelle": "Exclusion scolaire et non-achèvement",
                      "vars": ["ecoles_publiques_perdues_depuis_2017", "deficit_scolarisation", "deficit_achevement"]},
-    "D4_choc": {"poids": 0.175, "libelle": "Choc sécuritaire (déplacés internes)",
+    "D4_choc": {"poids": 0.275, "libelle": "Choc sécuritaire (déplacés internes)",
                 "vars": ["pdi_pour_100_enfants_6_11"]},
 }
+# poids estimes sur la cible (carnet 02), arrondis au quart de point ; pour les reestimer, rejouer le carnet 02
 DIMS = list(DIMENSIONS)
 
 PRIORITES = ["P1 - intervention immédiate", "P2 - surveillance renforcée", "P3 - vigilance",
@@ -106,13 +107,27 @@ def construire_47(panel, effectifs_47):
     ref = effectifs_47.drop(columns=["methode_effectif"], errors="ignore")
     out = variables_45(panel).merge(ref, on=["annee", "pcode_prov_old"], how="inner", suffixes=("_old45", ""))
     scinde = est_scindee(out.type_lien)
-    part = (100 * out.effectif / out.effectif_old45).round(1) / 100
+    part = (100 * out.effectif / out.effectif_old45).map(lambda v: round(float(v), 1)) / 100.0
+    # comme dans les carnets : l'effectif de la moitie = part x effectif de l'ancienne province, de sorte que les
+    # ratios (part du CM2, pression d'entree) restent ceux de l'ancienne province ; l'effectif propre (somme des
+    # communes) est conserve a part pour les volumes d'eleves.
+    out["effectif_propre"] = out["effectif"].astype(float)
+    out["effectif"] = out["effectif"].astype(float)
+    out.loc[scinde, "effectif"] = out.loc[scinde, "effectif_old45"] * part[scinde]
     for col in ("effectif_cm2", "nouv_cp1_T"):
         out[col] = out[col].astype(float)
         out.loc[scinde, col] = out.loc[scinde, col] * part[scinde]
     out["poids"] = np.where(scinde, part, 1.0)
     out["scindee"] = scinde
     return out.drop(columns=[c for c in out.columns if c.endswith("_old45")])
+
+
+def comme_les_carnets(p):
+    """Fait passer le panel par un fichier CSV, comme le font les carnets (le carnet 02 relit le panel ecrit par le
+    carnet 01). Cette lecture arrondit les decimales au dernier chiffre pres ; le boosting a erreur absolue y est
+    sensible, et sans ce passage les previsions s'ecarteraient jusqu'a un point de celles des carnets."""
+    from io import StringIO
+    return pd.read_csv(StringIO(p.to_csv(sep=";", decimal=",", index=False)), sep=";", decimal=",")
 
 
 def preparer(p):
@@ -204,7 +219,7 @@ def probabilite_alerte(data, cur):
 # =============================================================================
 def prevoir(panel, effectifs_47):
     """panel brut des 45 anciennes provinces + effectifs des 47 -> (table des 47 provinces, infos)."""
-    p = preparer(construire_47(panel, effectifs_47))
+    p = comme_les_carnets(preparer(construire_47(panel, effectifs_47)))
     I = calculer_ird(p)
     t = int(p.annee.max())
     data = p[p.y_next.notna() & p.taux_abandon.notna()]            # paires (t, t+1) observees
@@ -217,7 +232,7 @@ def prevoir(panel, effectifs_47):
     cur["prevision_haut80"] = np.maximum(cur.prevision_haut80_brut, cur.prevision)
     cur["proba_alerte"], part, seuil, coefficients = probabilite_alerte(data, cur)
     cur["signalee_alerte"] = cur.proba_alerte >= seuil
-    cur["eleves_decrocheurs_prevus"] = (cur.prevision / 100 * cur.effectif).round()
+    cur["eleves_decrocheurs_prevus"] = (cur.prevision / 100 * cur.effectif_propre).round()
 
     r = cur.merge(I[I.annee == t], on=["pcode_prov_new", "annee"])
     precedent = I[I.annee == t - 1].set_index("pcode_prov_new").IRD
@@ -236,7 +251,7 @@ def prevoir(panel, effectifs_47):
 
     colonnes = ["rang_IRD", "pcode_prov_new", "province_new", "region_new", "pcode_prov_old", "province_old",
                 "scindee", "source_risque", "methode_effectif", "poids", "IRD", "priorite", *DIMS, "evolution_IRD",
-                "taux_abandon", *NOYAU, "tbs_T", "ecoles_publiques_perdues_depuis_2017", "zone_crise", "effectif",
+                "taux_abandon", *NOYAU, "tbs_T", "ecoles_publiques_perdues_depuis_2017", "zone_crise", "effectif_propre",
                 "prevision", "prevision_bas80", "prevision_haut80", "prevision_bas80_brut", "prevision_haut80_brut",
                 "proba_alerte", "signalee_alerte", "eleves_decrocheurs_prevus"]
     r = r.merge(effectifs_47[effectifs_47.annee == t][["pcode_prov_new", "methode_effectif"]], on="pcode_prov_new",
@@ -247,7 +262,9 @@ def prevoir(panel, effectifs_47):
              "annees_apprentissage": f"{annee_label(int(data.annee.min()))} à {annee_label(int(data.annee.max()))}",
              "part_signalee": part, "seuil_alerte": seuil, "correction_intervalle": corr,
              "seuils_proba_priorite": seuils_proba, "coefficients_alerte": coefficients,
-             "historique_ird": I}
+             "historique_ird": I,
+             "historique": p[["annee", "pcode_prov_new", "taux_abandon", "effectif_propre"]]
+             .merge(I[["pcode_prov_new", "annee", "IRD"]], on=["pcode_prov_new", "annee"])}
     return resultat, infos
 
 

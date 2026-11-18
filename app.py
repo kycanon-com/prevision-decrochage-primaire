@@ -2,36 +2,74 @@
 """
 Plateforme de prevision du decrochage scolaire au primaire (Burkina Faso, 47 provinces du decoupage en vigueur).
 
+Deux pages :
+  - « Tableau de bord » : publique, une seule page dynamique (carte, chiffres cles, classement, evolution) ;
+  - « Administration » : protegee par mot de passe, pour ajouter une annee de donnees.
+
 Lancer en local :  streamlit run app.py
 Deploiement     :  voir DEPLOIEMENT.md
 """
+import hmac
 import json
 from io import BytesIO
 from pathlib import Path
 
+import altair as alt
 import numpy as np
 import pandas as pd
 import streamlit as st
 import streamlit.components.v1 as components
 from scipy.stats import spearmanr
 
+import carte as C
 import moteur as M
 
 ICI = Path(__file__).resolve().parent
-DONNEES = ICI / "donnees"
+FICHIERS_REQUIS = ["panel_base.csv", "effectifs_47.csv", "carte_47.json"]
+# les donnees sont normalement dans donnees/ ; on les accepte aussi a la racine du depot
+# (cas d'un depot GitHub fait en glissant les fichiers sans leur dossier)
+DONNEES = next((d for d in (ICI / "donnees", ICI) if (d / "panel_base.csv").exists()), ICI / "donnees")
 PUBLIE_45 = DONNEES / "annees_publiees.csv"            # chiffres des annees ajoutees (45 anciennes provinces)
 PUBLIE_47 = DONNEES / "effectifs_47_publies.csv"       # effectifs des 47 provinces pour ces annees
 
-st.set_page_config(page_title="Prévision du décrochage scolaire", page_icon="📊", layout="wide")
+st.set_page_config(page_title="Décrochage scolaire au primaire · Burkina Faso", page_icon="📊", layout="wide",
+                   initial_sidebar_state="collapsed")
 
-COULEURS_PRIORITE = {M.PRIORITES[0]: "#b2182b", M.PRIORITES[1]: "#ef8a62",
-                     M.PRIORITES[2]: "#fddbc7", M.PRIORITES[3]: "#d1e5f0"}
-LIBELLES = {
-    "rang_IRD": "Rang", "province_new": "Province", "region_new": "Région", "IRD": "Indice de risque",
-    "priorite": "Priorité", "taux_abandon": "Abandon t (%)", "prevision": "Abandon prévu t+1 (%)",
-    "prevision_bas80": "Bas 80 %", "prevision_haut80": "Haut 80 %", "proba_alerte": "Probabilité d'alerte (%)",
-    "signalee_alerte": "Signalée", "eleves_decrocheurs_prevus": "Élèves décrocheurs prévus",
-    "source_risque": "Source des taux", "zone_crise": "Zone de crise", "evolution_IRD": "Évolution de l'indice"}
+ROUGE = "#b2182b"
+COULEURS_PRIORITE = {"P1": "#b2182b", "P2": "#ef8a62", "P3": "#fddbc7", "P4": "#d1e5f0"}
+NOMS_PRIORITE = {"P1": "Intervention immédiate", "P2": "Surveillance renforcée", "P3": "Vigilance",
+                 "P4": "Suivi de routine"}
+NOUVELLES = ["Djelgodji", "Karo-Peli", "Dyamongou", "Gobnangou"]
+
+st.markdown("""
+<style>
+  .block-container {padding-top: 2.6rem; padding-bottom: 2rem; max-width: 1400px;}
+  [data-testid="stSidebar"], [data-testid="stSidebarCollapsedControl"] {display: none;}
+  div[data-testid="stMetric"] {background: #fafafa; border: 1px solid #ececec; border-left: 4px solid #b2182b;
+      border-radius: 6px; padding: 10px 14px;}
+  div[data-testid="stMetricLabel"] p {font-size: 0.82rem; color: #555;}
+  h1 {font-size: 1.75rem !important; margin-bottom: 0.1rem;}
+  .fiche {border: 1px solid #ececec; border-radius: 8px; padding: 14px 16px; background: #fff;}
+  .fiche h3 {margin: 0 0 2px 0; font-size: 1.25rem;}
+  .pastille {display:inline-block; padding: 2px 10px; border-radius: 12px; font-size: 0.8rem; font-weight: 600;
+      border: 1px solid #00000022;}
+  .fiche table {width: 100%; margin-top: 8px; border-collapse: collapse; font-size: 0.92rem;}
+  .fiche td {padding: 3px 0; border-bottom: 1px solid #f0f0f0;}
+  .fiche td:last-child {text-align: right; font-weight: 600;}
+</style>
+""", unsafe_allow_html=True)
+
+MANQUANTS = [f for f in FICHIERS_REQUIS if not (DONNEES / f).exists()]
+if MANQUANTS:
+    st.error("La plateforme ne trouve pas ses fichiers de données : " + ", ".join(MANQUANTS) + ".")
+    st.markdown("""
+Ces fichiers doivent se trouver dans un dossier **`donnees`** à côté de `app.py`, dans le dépôt GitHub.
+
+**Pour réparer** : sur github.com, ouvrir le dépôt → *Add file* → *Upload files* → glisser **le dossier `donnees`
+lui-même** (depuis le dossier `plateforme` de l'ordinateur) → *Commit changes*. La plateforme redémarre seule en
+une à deux minutes.
+""")
+    st.stop()
 
 
 # =============================================================================
@@ -48,6 +86,11 @@ def charger_carte():
     return json.loads((DONNEES / "carte_47.json").read_text(encoding="utf-8"))
 
 
+@st.cache_data
+def positions_noms(noms_tuple):
+    return C.positions_etiquettes(charger_carte(), dict(noms_tuple))
+
+
 def donnees_publiees():
     """Historique officiel + annees publiees par l'administrateur."""
     base, eff47 = charger_base()
@@ -60,7 +103,7 @@ def donnees_publiees():
     return base, eff47
 
 
-@st.cache_data(show_spinner="Entraînement des modèles et calcul des prévisions…")
+@st.cache_data(show_spinner="Calcul des prévisions…")
 def calculer(panel, eff47):
     return M.prevoir(panel, eff47)
 
@@ -68,7 +111,7 @@ def calculer(panel, eff47):
 def mot_de_passe_admin():
     try:
         return st.secrets["MOT_DE_PASSE_ADMIN"]
-    except Exception:                       # aucun secret configure : publication desactivee
+    except Exception:                       # aucun secret configure : espace administrateur ferme
         return None
 
 
@@ -78,8 +121,24 @@ def vers_excel(df):
     return tampon.getvalue()
 
 
+def afficher_html(html, hauteur):
+    """Affiche un bloc HTML autonome (st.iframe dans les versions recentes de Streamlit, components sinon)."""
+    if hasattr(st, "iframe"):
+        st.iframe(html, height=hauteur)
+    else:
+        components.html(html, height=hauteur)
+
+
+def nombre(v):
+    return f"{int(round(v)):,}".replace(",", " ")
+
+
+def code_priorite(texte):
+    return texte[:2]
+
+
 # =============================================================================
-# Affichage
+# Carte
 # =============================================================================
 def couleur_continue(v, vmin, vmax):
     x = 0.0 if vmax == vmin else float(np.clip((v - vmin) / (vmax - vmin), 0, 1))
@@ -88,87 +147,257 @@ def couleur_continue(v, vmin, vmax):
     return f"rgb({r},{g},{b})"
 
 
-def carte_svg(resultat, mode):
+def carte_svg(resultat, mode, visibles, choisie):
+    """Carte des 47 provinces : toutes les provinces portent leur nom ; celles qui sortent du filtre sont pâlies."""
     carte = charger_carte()
     r = resultat.set_index("pcode_prov_new")
+    noms = {k: r.at[k, "province_new"] for k in r.index}
+    pos = positions_noms(tuple(sorted(noms.items())))
     if mode == "Priorité":
-        couleur = {k: COULEURS_PRIORITE[r.at[k, "priorite"]] for k in r.index}
-        legende = "".join(f'<span style="display:inline-block;width:12px;height:12px;background:{c};'
-                          f'border:1px solid #888;margin:0 4px 0 12px"></span>{p}'
-                          for p, c in COULEURS_PRIORITE.items())
+        couleur = {k: COULEURS_PRIORITE[code_priorite(r.at[k, "priorite"])] for k in r.index}
+        legende = "".join(f'<span class="pt" style="background:{COULEURS_PRIORITE[p]}"></span>{NOMS_PRIORITE[p]}'
+                          for p in COULEURS_PRIORITE)
     else:
         col = "prevision" if mode.startswith("Abandon") else "IRD"
         vmin, vmax = r[col].min(), r[col].max()
         couleur = {k: couleur_continue(r.at[k, col], vmin, vmax) for k in r.index}
-        legende = (f'{vmin:.1f} <span style="display:inline-block;width:160px;height:12px;vertical-align:middle;'
-                   f'background:linear-gradient(90deg,rgb(255,237,160),rgb(128,0,38))"></span> {vmax:.1f}')
-    legende += ('<br><span style="display:inline-block;width:22px;border-top:2px dashed #222;'
-                'vertical-align:middle;margin-right:6px"></span>contour pointillé : province issue d\'une scission, '
-                'taux hérités de l\'ancienne province')
-    formes = []
+        legende = (f'{vmin:.0f} {"%" if col == "prevision" else ""}<span class="degrade"></span>'
+                   f'{vmax:.0f} {"%" if col == "prevision" else ""}')
+    legende += ('<span class="trait"></span>contour pointillé : nouvelle province (taux de la province d\'origine)')
+    formes, textes = [], []
     for code, geo in carte["provinces"].items():
         if code not in r.index:
             continue
         x = r.loc[code]
-        bulle = (f"{x.province_new} ({x.region_new})\n{x.priorite}\nIndice : {x.IRD:.1f} (rang {x.rang_IRD})\n"
-                 f"Abandon t : {x.taux_abandon:.1f} %\nPrévu t+1 : {x.prevision:.1f} % "
-                 f"[{x.prevision_bas80:.1f} ; {x.prevision_haut80:.1f}]\n"
-                 f"Élèves décrocheurs prévus : {int(x.eleves_decrocheurs_prevus):,}".replace(",", " ")
-                 + (f"\nTaux hérités de {x.province_old} (aucun taux publié par commune)" if x.scindee else ""))
-        trait = 'stroke="#222" stroke-width="1.4" stroke-dasharray="3,2"' if x.scindee else \
-                'stroke="#555" stroke-width="0.5"'
-        formes.append(f'<path d="{geo["path"]}" fill="{couleur[code]}" {trait}><title>{bulle}</title></path>')
-    return (f'<div style="font-family:sans-serif;font-size:13px">'
-            f'<svg viewBox="0 0 {carte["largeur"]} {carte["hauteur"]}" style="width:100%;max-height:560px">'
-            f'{"".join(formes)}</svg><div style="margin-top:6px;line-height:1.8">{legende}</div></div>')
+        bulle = (f"{x.province_new} ({x.region_new})\n{NOMS_PRIORITE[code_priorite(x.priorite)]}\n"
+                 f"Indice de risque : {x.IRD:.0f} / 100 (rang {x.rang_IRD} sur 47)\n"
+                 f"Abandon actuel : {x.taux_abandon:.1f} %\n"
+                 f"Abandon prévu : {x.prevision:.1f} % (entre {x.prevision_bas80:.1f} et {x.prevision_haut80:.1f})\n"
+                 f"Élèves susceptibles d'abandonner : {nombre(x.eleves_decrocheurs_prevus)}")
+        actif = code in visibles
+        if code == choisie:
+            trait = 'stroke="#000" stroke-width="2.6"'
+        elif x.scindee:
+            trait = 'stroke="#222" stroke-width="1.3" stroke-dasharray="3,2"'
+        else:
+            trait = 'stroke="#555" stroke-width="0.5"'
+        formes.append(f'<path d="{geo["path"]}" fill="{couleur[code]}" {trait} opacity="{1 if actif else 0.22}">'
+                      f'<title>{bulle}</title></path>')
+        tx, ty, ax, ay, deplace = pos[code]
+        if deplace:
+            textes.append(f'<line x1="{ax:.1f}" y1="{ay:.1f}" x2="{tx:.1f}" y2="{ty:.1f}" stroke="#222" '
+                          f'stroke-width="0.5"/><circle cx="{ax:.1f}" cy="{ay:.1f}" r="1.3" fill="#222"/>')
+        poids = "700" if code == choisie else "500"
+        textes.append(f'<text x="{tx:.1f}" y="{ty + 3:.1f}" text-anchor="middle" font-size="{C.FS}" '
+                      f'font-weight="{poids}" opacity="{1 if actif else 0.45}">{noms[code]}</text>')
+    return f"""
+<style>
+  body {{margin:0; font-family: "Source Sans Pro", sans-serif; font-size: 13px; color:#222}}
+  svg text {{fill:#111; stroke:#fff; stroke-width:2.4px; paint-order:stroke; pointer-events:none;
+            font-family: "Source Sans Pro", sans-serif;}}
+  svg path:hover {{stroke:#000; stroke-width:1.8px}}
+  .pt {{display:inline-block; width:12px; height:12px; border:1px solid #888; margin:0 5px 0 14px; vertical-align:-1px}}
+  .degrade {{display:inline-block; width:150px; height:11px; vertical-align:middle; margin:0 6px;
+            background:linear-gradient(90deg,rgb(255,237,160),rgb(128,0,38))}}
+  .trait {{display:inline-block; width:22px; border-top:2px dashed #222; vertical-align:middle; margin:0 6px 0 18px}}
+</style>
+<svg viewBox="0 0 {carte["largeur"]} {carte["hauteur"]}" style="width:100%;max-height:600px">
+{"".join(formes)}{"".join(textes)}</svg>
+<div style="margin-top:4px;line-height:1.9">{legende}</div>"""
 
 
-def afficher_prevision(resultat, infos, cle):
+# =============================================================================
+# Page dynamique : prevision et tableau de bord
+# =============================================================================
+def fiche_province(x, infos):
+    p = code_priorite(x.priorite)
     t, t1 = infos["annee_donnees"], infos["annee_prevue"]
-    n = resultat.priorite.str[:2].value_counts()
-    taux_moyen = np.average(resultat.prevision, weights=resultat.effectif.clip(lower=1))
+    lignes = [
+        (f"Indice de risque {M.annee_label(t)}", f"{x.IRD:.0f} / 100 (rang {x.rang_IRD} sur 47)"),
+        (f"Abandon {M.annee_label(t)}", f"{x.taux_abandon:.1f} %"),
+        (f"Abandon prévu {M.annee_label(t1)}", f"{x.prevision:.1f} %"),
+        ("Fourchette probable", f"{x.prevision_bas80:.1f} à {x.prevision_haut80:.1f} %"),
+        ("Alerte (abandon ≥ 15 %)", "oui" if x.signalee_alerte else "non"),
+        ("Élèves dans le primaire", nombre(x.effectif_propre)),
+        (f"Élèves susceptibles d'abandonner {M.annee_label(t1)}", nombre(x.eleves_decrocheurs_prevus)),
+    ]
+    corps = "".join(f"<tr><td>{a}</td><td>{b}</td></tr>" for a, b in lignes)
+    note = ""
+    if x.scindee:
+        note = (f'<p style="font-size:0.82rem;color:#555;margin:10px 0 0 0">Province créée à partir de '
+                f'{x.province_old}. Ses effectifs lui sont propres ; ses taux sont, pour l\'instant, ceux de '
+                f'{x.province_old}, faute de statistiques publiées par commune.</p>')
+    st.markdown(f'<div class="fiche"><h3>{x.province_new}</h3><span style="color:#666">{x.region_new}</span> '
+                f'&nbsp; <span class="pastille" style="background:{COULEURS_PRIORITE[p]};'
+                f'color:{"#fff" if p == "P1" else "#222"}">{NOMS_PRIORITE[p]}</span>'
+                f'<table>{corps}</table>{note}</div>', unsafe_allow_html=True)
 
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Provinces P1 / P2", f"{n.get('P1', 0)} / {n.get('P2', 0)}")
-    c2.metric(f"Abandon moyen prévu {M.annee_label(t1)}", f"{taux_moyen:.1f} %")
-    c3.metric("Élèves décrocheurs prévus", f"{int(resultat.eleves_decrocheurs_prevus.sum()):,}".replace(",", " "))
-    c4.metric("Provinces en alerte", int(resultat.signalee_alerte.sum()))
 
-    gauche, droite = st.columns([3, 2])
-    with gauche:
-        mode = st.radio("Colorer la carte selon", ["Priorité", f"Abandon prévu {M.annee_label(t1)}",
-                                                   f"Indice de risque {M.annee_label(t)}"],
-                        horizontal=True, key=f"mode_{cle}")
-        components.html(carte_svg(resultat, mode), height=660)
-        st.caption("Survolez une province pour voir ses chiffres.")
+def graphique_evolution(infos, resultat, codes):
+    """Abandon observé année par année, puis prévision de l'année suivante avec sa fourchette."""
+    h = infos["historique"][infos["historique"].pcode_prov_new.isin(codes)].merge(
+        resultat[["pcode_prov_new", "province_new"]], on="pcode_prov_new")
+    h = h.assign(periode=h.annee.map(M.annee_label))
+    t1 = M.annee_label(infos["annee_prevue"])
+    prev = resultat[resultat.pcode_prov_new.isin(codes)][["province_new", "prevision", "prevision_bas80",
+                                                          "prevision_haut80"]].assign(periode=t1)
+    ordre = [M.annee_label(a) for a in sorted(h.annee.unique())] + [t1]
+    x = alt.X("periode:N", sort=ordre, title=None, axis=alt.Axis(labelAngle=0))
+    couleur = alt.Color("province_new:N", title=None, legend=alt.Legend(orient="bottom"))
+    ligne = alt.Chart(h).mark_line(point=True, strokeWidth=2).encode(
+        x=x, y=alt.Y("taux_abandon:Q", title="Taux d'abandon (%)", scale=alt.Scale(zero=True)), color=couleur,
+        tooltip=[alt.Tooltip("province_new", title="Province"), alt.Tooltip("periode", title="Année"),
+                 alt.Tooltip("taux_abandon", title="Abandon (%)", format=".1f")])
+    barre = alt.Chart(prev).mark_rule(strokeWidth=4, opacity=0.35).encode(
+        x=x, y="prevision_bas80:Q", y2="prevision_haut80:Q", color=couleur)
+    point = alt.Chart(prev).mark_point(shape="diamond", size=170, filled=True).encode(
+        x=x, y="prevision:Q", color=couleur,
+        tooltip=[alt.Tooltip("province_new", title="Province"), alt.Tooltip("periode", title="Année prévue"),
+                 alt.Tooltip("prevision", title="Abandon prévu (%)", format=".1f"),
+                 alt.Tooltip("prevision_bas80", title="Bas (%)", format=".1f"),
+                 alt.Tooltip("prevision_haut80", title="Haut (%)", format=".1f")])
+    st.altair_chart((barre + ligne + point).properties(height=360), width="stretch")
+    st.caption("Le losange est la prévision de l'année suivante ; le trait vertical clair est la fourchette dans "
+               "laquelle l'abandon a 8 chances sur 10 de se situer.")
+
+
+def tableau_dynamique(resultat, infos, visibles_df):
+    t1 = M.annee_label(infos["annee_prevue"])
+    colonnes = ["rang_IRD", "province_new", "region_new", "priorite", "IRD", "taux_abandon", "prevision",
+                "prevision_bas80", "prevision_haut80", "proba_alerte", "eleves_decrocheurs_prevus"]
+    tab = visibles_df[colonnes].copy()
+    tab["priorite"] = tab.priorite.map(lambda s: NOMS_PRIORITE[code_priorite(s)])
+    tab["proba_alerte"] = 100 * tab.proba_alerte
+    noms = {"rang_IRD": "Rang", "province_new": "Province", "region_new": "Région", "priorite": "Priorité",
+            "IRD": "Indice de risque", "taux_abandon": "Abandon actuel (%)",
+            "prevision": f"Abandon prévu {t1} (%)", "prevision_bas80": "Fourchette basse (%)",
+            "prevision_haut80": "Fourchette haute (%)", "proba_alerte": "Risque d'alerte",
+            "eleves_decrocheurs_prevus": f"Élèves susceptibles d'abandonner {t1}"}
+    cfg = {noms[c]: st.column_config.NumberColumn(format="%.1f")
+           for c in ["IRD", "taux_abandon", "prevision", "prevision_bas80", "prevision_haut80"]}
+    cfg[noms["proba_alerte"]] = st.column_config.ProgressColumn(format="%.0f %%", min_value=0, max_value=100)
+    cfg[noms["eleves_decrocheurs_prevus"]] = st.column_config.NumberColumn(format="%d")
+    st.dataframe(tab.rename(columns=noms), hide_index=True, width="stretch", height=430, column_config=cfg)
+
+
+def rendu_dynamique(resultat, infos, cle):
+    """Page unique : filtres, chiffres clés, carte, fiche province, classement, évolution, régions."""
+    t, t1 = infos["annee_donnees"], infos["annee_prevue"]
+
+    f1, f2, f3 = st.columns([2, 2, 3])
+    regions = sorted(resultat.region_new.unique())
+    choix_regions = f1.multiselect("Régions", regions, placeholder="Toutes les régions", key=f"reg_{cle}")
+    choix_prio = f2.multiselect("Niveaux de priorité", [NOMS_PRIORITE[p] for p in NOMS_PRIORITE],
+                                placeholder="Tous les niveaux", key=f"prio_{cle}")
+    mode = f3.radio("Colorer la carte selon", ["Priorité", f"Abandon prévu {M.annee_label(t1)}",
+                                               f"Indice de risque {M.annee_label(t)}"],
+                    horizontal=True, key=f"mode_{cle}")
+
+    masque = pd.Series(True, index=resultat.index)
+    if choix_regions:
+        masque &= resultat.region_new.isin(choix_regions)
+    if choix_prio:
+        inv = {v: k for k, v in NOMS_PRIORITE.items()}
+        masque &= resultat.priorite.map(code_priorite).isin([inv[c] for c in choix_prio])
+    vis = resultat[masque]
+    if vis.empty:
+        st.warning("Aucune province ne correspond à ces filtres.")
+        return
+
+    # chiffres clés : calculés sur la sélection
+    n = vis.priorite.map(code_priorite).value_counts()
+    taux_moyen = np.average(vis.prevision, weights=vis.effectif_propre.clip(lower=1))
+    k1, k2, k3, k4 = st.columns(4)
+    k1.metric("Provinces en priorité 1", int(n.get("P1", 0)), help="Intervention immédiate recommandée.")
+    k2.metric(f"Abandon moyen prévu {M.annee_label(t1)}", f"{taux_moyen:.1f} %",
+              help="Moyenne des provinces sélectionnées, pondérée par le nombre d'élèves.")
+    k3.metric("Élèves susceptibles d'abandonner", nombre(vis.eleves_decrocheurs_prevus.sum()),
+              help=f"Estimation pour l'année {M.annee_label(t1)}, dans les provinces sélectionnées.")
+    k4.metric("Provinces en alerte", f"{int(vis.signalee_alerte.sum())} sur {len(vis)}",
+              help="Provinces où l'abandon risque de dépasser 15 %.")
+
+    gauche, droite = st.columns([5, 3], gap="large")
     with droite:
-        st.markdown("**Les 15 provinces les plus exposées**")
-        top = resultat.head(15)[["province_new", "priorite", "IRD", "taux_abandon", "prevision"]]
-        st.dataframe(top.rename(columns=LIBELLES), hide_index=True, width="stretch",
-                     column_config={c: st.column_config.NumberColumn(format="%.1f")
-                                    for c in ["Indice de risque", "Abandon t (%)", "Abandon prévu t+1 (%)"]})
+        options = ["Aucune (voir le classement)"] + sorted(vis.province_new)
+        province = st.selectbox("Voir le détail d'une province", options, key=f"prov_{cle}")
+        if province == options[0]:
+            st.markdown(f"**Les 10 provinces les plus exposées**")
+            top = vis.head(10)[["province_new", "priorite", "IRD", "prevision"]].copy()
+            top["priorite"] = top.priorite.map(lambda s: NOMS_PRIORITE[code_priorite(s)])
+            st.dataframe(top.rename(columns={"province_new": "Province", "priorite": "Priorité",
+                                             "IRD": "Indice", "prevision": f"Abandon prévu (%)"}),
+                         hide_index=True, width="stretch",
+                         column_config={"Indice": st.column_config.NumberColumn(format="%.0f"),
+                                        "Abandon prévu (%)": st.column_config.NumberColumn(format="%.1f")})
+            st.caption("Survolez la carte pour lire les chiffres d'une province, ou choisissez-la ci-dessus.")
+            choisie = None
+        else:
+            fiche_province(vis[vis.province_new == province].iloc[0], infos)
+            choisie = vis[vis.province_new == province].pcode_prov_new.iloc[0]
+    with gauche:
+        afficher_html(carte_svg(resultat, mode, set(vis.pcode_prov_new), choisie), 690)
 
-    st.markdown("**Les 47 provinces**")
-    colonnes = ["rang_IRD", "province_new", "region_new", "priorite", "IRD", "evolution_IRD", "taux_abandon",
-                "prevision", "prevision_bas80", "prevision_haut80", "proba_alerte", "signalee_alerte",
-                "eleves_decrocheurs_prevus", "zone_crise", "source_risque"]
-    tableau = resultat[colonnes].copy()
-    tableau["proba_alerte"] = 100 * tableau.proba_alerte
-    st.dataframe(tableau.rename(columns=LIBELLES), hide_index=True, width="stretch", height=420,
-                 column_config={
-                     **{LIBELLES[c]: st.column_config.NumberColumn(format="%.1f")
-                        for c in ["IRD", "evolution_IRD", "taux_abandon", "prevision", "prevision_bas80",
-                                  "prevision_haut80"]},
-                     LIBELLES["proba_alerte"]: st.column_config.ProgressColumn(format="%.0f", min_value=0,
-                                                                               max_value=100),
-                     LIBELLES["eleves_decrocheurs_prevus"]: st.column_config.NumberColumn(format="%d")})
-    st.download_button("Télécharger toutes les colonnes (Excel)", vers_excel(resultat),
-                       file_name=f"prevision_{M.annee_label(t1)}.xlsx", key=f"dl_{cle}")
-    st.caption(f"Modèles réentraînés sur {infos['n_lignes_apprentissage']} lignes province × année "
-               f"({infos['annees_apprentissage']}), poids total {infos['poids_apprentissage']:.0f}. "
-               "Détails : page « Méthode et sources ».")
+    onglets = st.tabs(["Classement des provinces", "Évolution de l'abandon", "Par région"])
+    with onglets[0]:
+        tableau_dynamique(resultat, infos, vis)
+        st.download_button("Télécharger le tableau (Excel)", vers_excel(resultat), key=f"dl_{cle}",
+                           file_name=f"prevision_{M.annee_label(t1)}.xlsx")
+    with onglets[1]:
+        defaut = [choisie] if choisie else list(vis.head(3).pcode_prov_new)
+        noms = dict(zip(vis.pcode_prov_new, vis.province_new))
+        sel = st.multiselect("Provinces à comparer", list(noms), default=defaut, format_func=noms.get,
+                             max_selections=8, key=f"evo_{cle}_{choisie}")
+        if sel:
+            graphique_evolution(infos, resultat, sel)
+        else:
+            st.info("Choisissez au moins une province.")
+    with onglets[2]:
+        reg = (vis.groupby("region_new").agg(eleves=("eleves_decrocheurs_prevus", "sum"),
+                                             provinces=("province_new", "size"))
+               .reset_index().sort_values("eleves", ascending=False))
+        graphe = alt.Chart(reg).mark_bar(color=ROUGE).encode(
+            y=alt.Y("region_new:N", sort="-x", title=None),
+            x=alt.X("eleves:Q", title=f"Élèves susceptibles d'abandonner en {M.annee_label(t1)}"),
+            tooltip=[alt.Tooltip("region_new", title="Région"), alt.Tooltip("provinces", title="Provinces"),
+                     alt.Tooltip("eleves", title="Élèves", format=",.0f")])
+        st.altair_chart(graphe.properties(height=max(220, 26 * len(reg))), width="stretch")
+
+    nouv = vis[vis.province_new.isin(NOUVELLES)]
+    if len(nouv):
+        with st.expander("Les quatre nouvelles provinces : Djelgodji, Karo-Peli, Dyamongou, Gobnangou"):
+            st.markdown("Ces provinces ont leurs propres effectifs, donc leurs propres volumes d'élèves. Leurs taux "
+                        "sont pour l'instant ceux de la province d'origine (Soum, Tapoa), les statistiques par commune "
+                        "n'étant pas encore publiées. Dès que l'administrateur charge de nouvelles données, leurs "
+                        "chiffres propres s'affichent ici.")
+            st.dataframe(nouv[["province_new", "province_old", "effectif_propre", "taux_abandon", "prevision",
+                               "eleves_decrocheurs_prevus"]].rename(columns={
+                                   "province_new": "Province", "province_old": "Province d'origine",
+                                   "effectif_propre": "Élèves", "taux_abandon": "Abandon actuel (%)",
+                                   "prevision": "Abandon prévu (%)",
+                                   "eleves_decrocheurs_prevus": "Élèves susceptibles d'abandonner"}),
+                         hide_index=True, width="stretch",
+                         column_config={"Abandon actuel (%)": st.column_config.NumberColumn(format="%.1f"),
+                                        "Abandon prévu (%)": st.column_config.NumberColumn(format="%.1f"),
+                                        "Élèves": st.column_config.NumberColumn(format="%d"),
+                                        "Élèves susceptibles d'abandonner": st.column_config.NumberColumn(format="%d")})
 
 
+def page_tableau_de_bord():
+    panel, eff47 = donnees_publiees()
+    resultat, infos = calculer(panel, eff47)
+    t, t1 = infos["annee_donnees"], infos["annee_prevue"]
+    st.title("Décrochage scolaire au primaire")
+    st.markdown(f"**Burkina Faso · 47 provinces** — situation {M.annee_label(t)} et prévision "
+                f"{M.annee_label(t1)}. Filtrez par région ou par niveau de priorité : les chiffres, la carte et les "
+                "graphiques suivent.")
+    rendu_dynamique(resultat, infos, "public")
+    st.caption("Sources : DGESS / MENAPLN, INSD, CONASUR. Une prévision est une estimation : la fourchette indique "
+               "la marge d'incertitude.")
+
+
+# =============================================================================
+# Administration (protegee)
+# =============================================================================
 def bilan_prevision_precedente(panel_avant, eff_avant, lignes):
     """Compare la prevision qui avait ete faite pour l'annee chargee aux chiffres reels saisis."""
     if panel_avant.annee.max() != lignes.annee.iloc[0] - 1:
@@ -181,53 +410,52 @@ def bilan_prevision_precedente(panel_avant, eff_avant, lignes):
     ecart = (m.prevision - m.taux_abandon).abs()
     dedans = ((m.taux_abandon >= m.prevision_bas80) & (m.taux_abandon <= m.prevision_haut80)).mean()
     with st.expander(f"Bilan : la prévision faite pour {M.annee_label(int(lignes.annee.iloc[0]))} face aux chiffres "
-                     "saisis (45 anciennes provinces)"):
+                     "saisis"):
         a, b, c = st.columns(3)
-        a.metric("Erreur absolue moyenne", f"{ecart.mean():.1f} points")
+        a.metric("Erreur moyenne", f"{ecart.mean():.1f} points")
         b.metric("Corrélation de rang", f"{spearmanr(m.prevision, m.taux_abandon).correlation:.2f}")
-        c.metric("Dans l'intervalle à 80 %", f"{100 * dedans:.0f} %")
+        c.metric("Dans la fourchette", f"{100 * dedans:.0f} %")
         st.dataframe(m.assign(ecart=m.taux_abandon - m.prevision).sort_values("ecart", key=abs, ascending=False)
                      .rename(columns={"province_old": "Province", "prevision": "Prévu", "taux_abandon": "Observé",
-                                      "ecart": "Écart", "prevision_bas80": "Bas 80 %",
-                                      "prevision_haut80": "Haut 80 %"}).drop(columns="pcode_prov_old"),
-                     hide_index=True, width="stretch")
+                                      "ecart": "Écart", "prevision_bas80": "Bas", "prevision_haut80": "Haut"})
+                     .drop(columns="pcode_prov_old"), hide_index=True, width="stretch")
 
 
-# =============================================================================
-# Pages
-# =============================================================================
-def page_prevision():
-    panel, eff47 = donnees_publiees()
-    resultat, infos = calculer(panel, eff47)
-    st.header(f"Prévision {M.annee_label(infos['annee_prevue'])}")
-    officiel = infos["annee_donnees"] <= charger_base()[0].annee.max()
-    st.caption(f"À partir des données {M.annee_label(infos['annee_donnees'])} "
-               + ("(données officielles)" if officiel else "(année ajoutée par l'administrateur)")
-               + " · 47 provinces du découpage en vigueur")
-    afficher_prevision(resultat, infos, "publie")
+def connexion_admin():
+    """Vrai si l'administrateur est connecté ; sinon affiche le formulaire de connexion."""
+    if st.session_state.get("admin_ok"):
+        return True
+    attendu = mot_de_passe_admin()
+    if attendu is None:
+        st.info("L'espace administrateur n'est pas activé : aucun mot de passe n'est configuré sur le serveur "
+                "(voir DEPLOIEMENT.md).")
+        return False
+    with st.form("connexion_admin"):
+        saisi = st.text_input("Mot de passe administrateur", type="password")
+        envoye = st.form_submit_button("Se connecter")
+    if envoye:
+        if hmac.compare_digest(saisi.encode(), str(attendu).encode()):
+            st.session_state["admin_ok"] = True
+            st.rerun()
+        st.error("Mot de passe incorrect.")
+    return False
 
 
-def page_mise_a_jour():
+def admin_ajouter_annee():
     panel, eff47 = donnees_publiees()
     suivante = int(panel.annee.max()) + 1
-    st.header("Mettre à jour une année")
-    st.markdown(f"""
-Chargez les chiffres d'une nouvelle année scolaire **t** (réels ou estimés) : la plateforme calcule les variables,
-réentraîne les modèles avec cette année et affiche immédiatement la prévision **t+1** des 47 provinces.
-
-Dernière année connue : **{M.annee_label(suivante - 1)}**. Année attendue : **{M.annee_label(suivante)}**.
-""")
+    st.markdown(f"Dernière année en ligne : **{M.annee_label(suivante - 1)}**. Année à ajouter : "
+                f"**{M.annee_label(suivante)}**. La plateforme recalcule alors la prévision de "
+                f"{M.annee_label(suivante + 1)} pour les 47 provinces.")
 
     st.subheader("1. Télécharger le modèle Excel")
     st.markdown(f"""
-Le classeur est **pré-rempli avec {M.annee_label(suivante - 1)}** : remplacez les valeurs.
+Le classeur est pré-rempli avec {M.annee_label(suivante - 1)} : remplacez les valeurs par celles de la nouvelle année.
 - Feuille **saisie** : les 45 provinces de l'ancien découpage (celui des annuaires DGESS), 12 chiffres chacune.
-- Feuille **provinces_scindees** *(facultative)* : l'effectif propre de Djelgodji, Karo-Peli, Dyamongou et
-  Gobnangou. Laissée vide, la plateforme reprend les parts de l'année précédente.
+- Feuille **provinces_scindees** *(facultative)* : l'effectif propre de Djelgodji, Karo-Peli, Dyamongou et Gobnangou.
+  C'est elle qui donne à ces provinces leurs volumes propres. Laissée vide, les parts de l'année précédente sont reprises.
 - Feuille **notice** : la description de chaque colonne.
 """)
-    st.dataframe(pd.DataFrame([{"colonne": c, "contenu": lib} for c, (lib, _, _) in M.COLONNES_SAISIE.items()]),
-                 hide_index=True)
     st.download_button(f"Télécharger le modèle {M.annee_label(suivante)}", M.creer_modele_excel(panel, eff47, suivante),
                        file_name=f"saisie_{M.annee_label(suivante)}.xlsx")
 
@@ -246,156 +474,64 @@ Le classeur est **pré-rempli avec {M.annee_label(suivante - 1)}** : remplacez l
     annee = int(lignes.annee.iloc[0])
     st.success(f"Fichier valide : 45 anciennes provinces et 47 provinces en vigueur, année {M.annee_label(annee)}.")
 
-    st.subheader(f"3. Prévision {M.annee_label(annee + 1)}")
+    st.subheader(f"3. Aperçu de la prévision {M.annee_label(annee + 1)}")
+    st.caption("Cet aperçu n'est visible que de vous tant que vous n'avez pas publié.")
     nouveau, nouveau47 = M.ajouter_annee(panel, lignes), M.ajouter_annee(eff47, lignes47)
     resultat, infos = calculer(nouveau, nouveau47)
     bilan_prevision_precedente(panel[panel.annee < annee], eff47[eff47.annee < annee], lignes)
-    afficher_prevision(resultat, infos, "simulation")
+    rendu_dynamique(resultat, infos, "apercu")
 
     st.subheader("4. Publier pour tous les visiteurs")
-    attendu = mot_de_passe_admin()
-    if attendu is None:
-        st.info("Publication désactivée : aucun mot de passe administrateur n'est configuré sur le serveur "
-                "(voir DEPLOIEMENT.md). La prévision ci-dessus reste visible dans votre session.")
-        return
-    saisi = st.text_input("Mot de passe administrateur", type="password")
-    if st.button(f"Publier {M.annee_label(annee)} et la prévision {M.annee_label(annee + 1)}"):
-        if saisi != attendu:
-            st.error("Mot de passe incorrect.")
-            return
+    if st.button(f"Publier {M.annee_label(annee)} et la prévision {M.annee_label(annee + 1)}", type="primary"):
         for fichier_publie, nouvelles in ((PUBLIE_45, lignes), (PUBLIE_47, lignes47)):
             deja = pd.read_csv(fichier_publie, dtype=str) if fichier_publie.exists() else None
             if deja is not None:
                 deja["annee"] = deja.annee.astype(int)
                 nouvelles = pd.concat([deja[deja.annee < annee], nouvelles.astype({"annee": int})])
             nouvelles.to_csv(fichier_publie, index=False, encoding="utf-8")
-        st.success(f"{M.annee_label(annee)} publiée : la page « Prévision » affiche désormais "
+        st.success(f"{M.annee_label(annee)} publiée : le tableau de bord affiche désormais la prévision "
                    f"{M.annee_label(annee + 1)}.")
+        st.caption("Pour rendre cette année permanente après un redémarrage du serveur, déposez les deux fichiers "
+                   "de l'onglet « Années publiées » dans le dossier `donnees/` du dépôt GitHub.")
 
 
-def page_tableau_de_bord():
-    st.caption("Tableau de bord de l'analyse publiée (données officielles 2017-18 à 2024-25).")
-    components.html((DONNEES / "tableau_de_bord.html").read_text(encoding="utf-8"), height=1500, scrolling=True)
-
-
-def page_methode():
-    panel, eff47 = donnees_publiees()
-    resultat, infos = calculer(panel, eff47)
-    st.header("Méthode et sources")
-    st.markdown(f"""
-### Ce que fait la plateforme
-Elle **décrit** la situation de l'année t avec un indice de risque, et **anticipe** l'année t+1 avec deux
-modèles : une prévision du taux d'abandon et une probabilité d'alerte. Les deux ne se croisent qu'à la règle de
-priorité. Les calculs sont ceux de l'analyse publiée ; la plateforme les rejoue à chaque nouvelle année.
-
-### Unité : les 47 provinces du découpage en vigueur
-Les annuaires de la DGESS publient les taux sur les **45 provinces de l'ancien découpage**. Deux d'entre elles ont
-été scindées : le **Soum** en Djelgodji et Karo-Peli, la **Tapoa** en Dyamongou et Gobnangou.
-- Leurs **effectifs** sont connus par commune (annuaires régionaux de l'INSD) : chaque moitié a son effectif
-  propre, et la somme des deux retombe exactement sur le total DGESS. Le CM2 et les nouveaux inscrits au CP1 sont
-  répartis selon la part d'effectif de chaque moitié.
-- Leurs **taux** (abandon, redoublement, achèvement, scolarisation) ne sont publiés par aucune source à l'échelle
-  de la commune : les deux moitiés **héritent des taux de l'ancienne province**. Leur indice et leur prévision
-  sont donc presque identiques. Les petits écarts entre deux moitiés viennent seulement de la répartition des
-  effectifs, pas d'une information propre. Sur la carte, ces quatre provinces ont un contour pointillé.
-- Pour qu'une province scindée ne compte pas double dans l'apprentissage, chaque moitié reçoit un **poids égal à
-  sa part d'effectif** (les 43 autres provinces ont un poids de 1).
-
-### Indice de risque de décrochage (IRD)
-Trois dimensions, chacune en rang percentile parmi les provinces de l'année :
-abandon en cours de cycle (35 %) · exclusion scolaire et non-achèvement (47,5 %) · choc sécuritaire (17,5 %).
-
-### Prévision du taux d'abandon de l'année suivante
-Moyenne de deux termes : le **niveau propre de la province** (moyenne de son taux d'abandon passé) et un modèle de
-**boosting de gradient** sur six variables, le noyau dit L11 :
-""")
-    st.dataframe(pd.DataFrame([{"variable": k, "signification": v} for k, v in M.LIBELLES_NOYAU.items()]),
-                 hide_index=True, width="stretch")
-    corr = infos["correction_intervalle"]
-    st.markdown(f"""
-Aucune de ces variables n'est dérivée du taux d'abandon. À l'échelle d'une province, le **redoublement** est associé à
-*moins* d'abandon l'année suivante : redoubler et abandonner se substituent dans le décompte des flux d'élèves. Ce
-signe est mesuré, pas présenté comme une confirmation de la littérature.
-
-**Intervalle à 80 %** : bornes à 10 % et 90 % (boosting quantile), élargies d'une correction mesurée sur la dernière
-année connue, séparément pour les provinces stables ({corr['stables']:.1f} points) et en crise
-({corr['crise']:.1f} points). La prévision affichée est toujours ramenée dans son intervalle.
-
-### Probabilité d'alerte
-Régression logistique sur les mêmes six variables ; l'alerte est un abandon d'au moins 15 % l'année suivante. On
-signale autant de provinces que le modèle en attend sur l'année (part bornée entre 5 et 60 %). Cette probabilité est
-fiable **comme rang** (qui passe avant qui), moins comme niveau.
-
-### Priorité
-P1 / P2 / P3 si l'indice dépasse 70 / 55 / 40, **ou** si la probabilité d'alerte est parmi les plus fortes
-(parts 5/45, 12/45 et 20/45 des provinces) ; sinon P4.
-
-### Fiabilité mesurée (analyse publiée, années 2022 à 2024, apprentissage sur les seules années antérieures)
-| | Indicateur | Valeur |
-|---|---|---|
-| Prévision | erreur absolue moyenne | 11,1 points |
-| Prévision | corrélation de rang avec l'observé | 0,32 |
-| Alerte | aire sous la courbe (AUC) | 0,84 |
-
-À titre de comparaison, le seul niveau historique de la province, sans modèle, obtient 11,2 points d'erreur et 0,33 de
-corrélation de rang : le modèle apporte surtout la probabilité d'alerte, et la prévision reste prudente. La
-prévision ne porte que sur l'année suivante ; au-delà de deux ans, la précision s'effondre.
-
-### Sources
-- DGESS / MENAPLN : annuaires statistiques de l'enseignement primaire (effectifs, taux d'abandon, de redoublement,
-  d'achèvement et de scolarisation, écoles).
-- INSD : annuaires statistiques régionaux (effectifs par commune), projections de population (6-11 ans).
-- CONASUR : personnes déplacées internes.
-- COD-AB (OCHA) : limites des 47 provinces, pour la carte.
-
-### Vérification
-Sur les données officielles, la plateforme redonne les résultats de l'analyse publiée à 10⁻¹⁴ près : indice des
-376 lignes province × année, prévision, intervalle, probabilité et priorité des 47 provinces (script
-`verifier_moteur.py`).
-""")
-
-
-def page_administration():
-    st.header("Administration")
-    attendu = mot_de_passe_admin()
+def admin_annees_publiees():
     if not (PUBLIE_45.exists() and PUBLIE_47.exists()):
-        st.info("Aucune année ajoutée : la plateforme utilise les données officielles 2017-18 à 2024-25.")
+        st.info("Aucune année n'a été ajoutée : la plateforme utilise les données officielles "
+                f"{M.annee_label(int(charger_base()[0].annee.min()))} à {M.annee_label(int(charger_base()[0].annee.max()))}.")
         return
     ajout = pd.read_csv(PUBLIE_45, dtype={"pcode_prov_old": str})
-    st.markdown("Années ajoutées : " + ", ".join(M.annee_label(int(a)) for a in sorted(ajout.annee.unique())))
+    st.markdown("Années ajoutées : **" + ", ".join(M.annee_label(int(a)) for a in sorted(ajout.annee.unique())) + "**")
     st.markdown("Pour rendre ces années permanentes, déposez les **deux** fichiers suivants dans le dossier "
                 "`donnees/` du dépôt GitHub :")
     st.download_button("Télécharger annees_publiees.csv", PUBLIE_45.read_bytes(), file_name="annees_publiees.csv")
     st.download_button("Télécharger effectifs_47_publies.csv", PUBLIE_47.read_bytes(),
                        file_name="effectifs_47_publies.csv")
-    if attendu is None:
-        return
-    saisi = st.text_input("Mot de passe administrateur", type="password", key="mdp_admin")
+    st.divider()
     if st.button("Retirer les années ajoutées (revenir aux données officielles)"):
-        if saisi == attendu:
-            PUBLIE_45.unlink(missing_ok=True)
-            PUBLIE_47.unlink(missing_ok=True)
-            st.success("Années retirées.")
-        else:
-            st.error("Mot de passe incorrect.")
+        PUBLIE_45.unlink(missing_ok=True)
+        PUBLIE_47.unlink(missing_ok=True)
+        st.success("Années retirées.")
+        st.rerun()
+
+
+def page_administration():
+    st.title("Espace administrateur")
+    if not connexion_admin():
+        return
+    colonne, _ = st.columns([1, 5])
+    if colonne.button("Se déconnecter"):
+        st.session_state["admin_ok"] = False
+        st.rerun()
+    onglets = st.tabs(["Ajouter une année", "Années publiées"])
+    with onglets[0]:
+        admin_ajouter_annee()
+    with onglets[1]:
+        admin_annees_publiees()
 
 
 # =============================================================================
-st.sidebar.title("Décrochage scolaire")
-st.sidebar.caption("Primaire · Burkina Faso · 47 provinces")
-page = st.sidebar.radio("Page", ["Prévision", "Mettre à jour une année", "Méthode et sources",
-                                 "Tableau de bord de l'analyse", "Administration"])
-st.sidebar.markdown("---")
-st.sidebar.caption("La prévision porte sur l'année scolaire suivant la dernière année chargée. "
-                   "Les modèles sont réentraînés à chaque nouvelle année.")
-
-if page == "Prévision":
-    page_prevision()
-elif page == "Mettre à jour une année":
-    page_mise_a_jour()
-elif page == "Méthode et sources":
-    page_methode()
-elif page == "Tableau de bord de l'analyse":
-    page_tableau_de_bord()
-else:
-    page_administration()
+pages = [st.Page(page_tableau_de_bord, title="Tableau de bord", icon=":material/dashboard:", default=True,
+                 url_path="tableau-de-bord"),
+         st.Page(page_administration, title="Administration", icon=":material/lock:", url_path="administration")]
+st.navigation(pages, position="top").run()

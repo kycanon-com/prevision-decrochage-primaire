@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
 """
 Verifie le moteur de la plateforme :  python verifier_moteur.py
-  1. sur l'historique officiel, il redonne les resultats deposes par le pipeline (47 provinces, noyau L11) :
-     synthese 2025-26 et historique de l'indice 2017-2024
+  1. sur l'historique officiel, il redonne les resultats des carnets Jupyter (47 provinces, noyau L11) :
+     resultat 2025-26 (arrondi a 0,01 dans les carnets) et historique de l'indice 2017-2024
   2. le parcours administrateur (modele Excel -> saisie -> chargement -> prevision) redonne les memes resultats,
      effectifs des provinces scindees saisis ; et fonctionne quand ils sont laisses vides (parts reprises)
   3. les controles de saisie rejettent les fichiers errones
@@ -17,13 +17,15 @@ import pandas as pd
 import moteur as M
 
 ICI = Path(__file__).resolve().parent
-DEPOTS = ICI.parent / "depots" / "04_analyse"
+REFERENCE = ICI / "donnees" / "reference"        # sorties des carnets 01-02, copiees ici
 base = pd.read_csv(ICI / "donnees" / "panel_base.csv")
 eff47 = pd.read_csv(ICI / "donnees" / "effectifs_47.csv")
-synthese = pd.read_csv(glob(str(DEPOTS / "*synthese-province-v2*"))[0], sep=";", decimal=",").set_index("pcode_prov_new")
-historique = pd.read_csv(glob(str(DEPOTS / "*historique-indice-risque*"))[0], sep=";", decimal=",")
+synthese = pd.read_csv(REFERENCE / "resultat_47_provinces.csv", sep=";", decimal=",").set_index("pcode_prov_new")
+historique = pd.read_csv(REFERENCE / "indice_historique.csv", sep=";", decimal=",")
+historique = historique.rename(columns={"D3_choc": "D4_choc"})      # les carnets nomment ainsi la 3e dimension
 echecs = []
-TOL = 1e-9
+TOL = 1e-9                  # historique de l'indice : colonnes non arrondies
+TOL_ARRONDI = 0.0051        # resultats 2025-26 : arrondis a 2 decimales dans les carnets
 
 
 def verdict(ok, texte):
@@ -35,11 +37,14 @@ def verdict(ok, texte):
 def comparer(resultat, infos, titre):
     print(f"\n--- {titre}")
     r = resultat.set_index("pcode_prov_new").loc[synthese.index]
-    for ours, ref in [("IRD", "IRD"), ("prevision", "prev"), ("prevision_bas80", "prev_lo"),
-                      ("prevision_haut80", "prev_hi"), ("proba_alerte", "p_alerte")]:
+    for ours, ref in [("IRD", "IRD"), ("prevision", "prevision"), ("prevision_bas80_brut", "prevision_basse"),
+                      ("prevision_haut80_brut", "prevision_haute"), ("proba_alerte", "p_alerte")]:
         ecart = float(np.nanmax(np.abs(r[ours] - synthese[ref])))
-        verdict(ecart <= TOL, f"{ours:24s} ecart max {ecart:.2e}")
-    verdict((r.priorite == synthese.priorite).all(), "priorite identique")
+        verdict(ecart <= TOL_ARRONDI, f"{ours:24s} ecart max {ecart:.2e}")
+    verdict((r.priorite.str[:2] == synthese.priorite.str[:2]).all(), "priorite identique")
+    n = r[M.est_scindee(r.type_lien) if "type_lien" in r else r.scindee]
+    verdict(n.effectif_propre.nunique() == len(n) and (n.eleves_decrocheurs_prevus > 0).all(),
+            "les 4 nouvelles provinces ont chacune leur effectif et leur volume d'eleves prevus")
     h = infos["historique_ird"].merge(historique, on=["pcode_prov_new", "annee"], suffixes=("", "_ref"))
     verdict(len(h) == len(historique) == 376, f"historique de l'indice : {len(h)} lignes sur {len(historique)}")
     for c in ["D1_abandon", "D2_exclusion", "D4_choc", "IRD"]:

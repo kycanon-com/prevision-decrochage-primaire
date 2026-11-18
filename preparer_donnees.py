@@ -7,7 +7,7 @@ Extrait des fichiers du projet ce dont la plateforme a besoin, dans plateforme/d
   - panel_base.csv        historique officiel, 45 anciennes provinces x 2017-2024, 12 chiffres bruts
   - effectifs_47.csv      effectifs des 47 provinces en vigueur et methode de chaque chiffre
   - carte_47.json         contours simplifies des 47 provinces (COD-AB, Data Pack)
-  - tableau_de_bord.html  le tableau de bord de l'analyse, affiche tel quel
+  - reference/            sorties des carnets (resultat 2025-26, historique de l'indice), pour verifier_moteur.py
 """
 import json
 import math
@@ -79,9 +79,17 @@ manquantes = set(p47.pcode_prov_new) - set(carte["provinces"])
 print(f"carte_47.json    : {len(carte['provinces'])} provinces, "
       f"{(SORTIE / 'carte_47.json').stat().st_size // 1024} ko ; codes sans contour : {manquantes or 'aucun'}")
 
-# --- tableau de bord de l'analyse
-shutil.copy(V2 / "site_en_ligne" / "index.html", SORTIE / "tableau_de_bord.html")
-print("tableau_de_bord.html copie")
+# --- sorties de reference des carnets (verifier_moteur.py)
+REF = SORTIE / "reference"
+REF.mkdir(exist_ok=True)
+for nom in ("resultat_47_provinces.csv", "indice_historique.csv"):
+    source = V2 / "carnets" / "sorties" / nom
+    if source.exists():
+        shutil.copy(source, REF / nom)
+        print(f"reference/{nom} copie")
+    else:
+        print(f"reference/{nom} : lancez d'abord les carnets 01 et 02 (carnets/sorties/ absent), fichier conserve")
+(SORTIE / "tableau_de_bord.html").unlink(missing_ok=True)       # l'ancien tableau de bord est integre a l'application
 
 # --- l'ancienne carte a 45 provinces n'est plus utilisee
 (SORTIE / "carte.json").unlink(missing_ok=True)
