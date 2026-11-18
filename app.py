@@ -147,68 +147,179 @@ def couleur_continue(v, vmin, vmax):
     return f"rgb({r},{g},{b})"
 
 
-def carte_svg(resultat, mode, visibles, choisie):
-    """Carte des 47 provinces : toutes les provinces portent leur nom ; celles qui sortent du filtre sont pâlies."""
+def agreger_regions(resultat):
+    """Une ligne par region (17) : moyennes ponderees par les effectifs, effectifs cumules, provinces par priorite."""
+    r = resultat.assign(w=resultat.effectif_propre.clip(lower=1), p=resultat.priorite.map(code_priorite))
+    lignes = []
+    for nom, g in r.groupby("region_new"):
+        ligne = {"region_new": nom, "provinces": len(g), "effectif": g.effectif_propre.sum(),
+                 "eleves_decrocheurs_prevus": g.eleves_decrocheurs_prevus.sum(),
+                 "en_alerte": int(g.signalee_alerte.sum()), "P1": int((g.p == "P1").sum()),
+                 "P2": int((g.p == "P2").sum()), "P3": int((g.p == "P3").sum())}
+        for c in ("IRD", "taux_abandon", "prevision", "prevision_bas80", "prevision_haut80"):
+            ligne[c] = float(np.average(g[c], weights=g.w))
+        lignes.append(ligne)
+    reg = pd.DataFrame(lignes)
+    s1, s2, s3 = M.SEUILS_IRD
+    reg["priorite"] = reg.IRD.map(lambda v: "P1" if v >= s1 else "P2" if v >= s2 else "P3" if v >= s3 else "P4")
+    reg["rang_IRD"] = reg.IRD.rank(ascending=False, method="min").astype(int)
+    return reg.sort_values("rang_IRD").reset_index(drop=True)
+
+
+@st.cache_data
+def positions_regions(noms_tuple):
+    carte = charger_carte()
+    pseudo = {"largeur": carte["largeur"], "hauteur": carte["hauteur"],
+              "provinces": {k: {"path": v["path"]} for k, v in carte["regions"].items()}}
+    return C.positions_etiquettes(pseudo, dict(noms_tuple))
+
+
+def carte_svg(resultat, mode, visibles, choisie, niveau="Provinces", regions=None):
+    """Carte : au niveau des provinces (47 noms) ou des regions (17 noms). Les limites de region sont toujours tracees ;
+    ce qui sort du filtre est palie."""
     carte = charger_carte()
     r = resultat.set_index("pcode_prov_new")
-    noms = {k: r.at[k, "province_new"] for k in r.index}
-    pos = positions_noms(tuple(sorted(noms.items())))
+    par_region = niveau == "Régions"
+    if par_region:
+        R = regions.set_index("region_new")
+        table, cle_de = R, r.region_new.to_dict()
+        visibles_cles = set(r.loc[list(visibles)].region_new)
+    else:
+        table, cle_de, visibles_cles = r, {k: k for k in r.index}, set(visibles)
     if mode == "Priorité":
-        couleur = {k: COULEURS_PRIORITE[code_priorite(r.at[k, "priorite"])] for k in r.index}
+        couleur = {k: COULEURS_PRIORITE[code_priorite(table.at[k, "priorite"])] for k in table.index}
         legende = "".join(f'<span class="pt" style="background:{COULEURS_PRIORITE[p]}"></span>{NOMS_PRIORITE[p]}'
                           for p in COULEURS_PRIORITE)
     else:
         col = "prevision" if mode.startswith("Abandon") else "IRD"
-        vmin, vmax = r[col].min(), r[col].max()
-        couleur = {k: couleur_continue(r.at[k, col], vmin, vmax) for k in r.index}
+        vmin, vmax = table[col].min(), table[col].max()
+        couleur = {k: couleur_continue(table.at[k, col], vmin, vmax) for k in table.index}
         legende = (f'{vmin:.0f} {"%" if col == "prevision" else ""}<span class="degrade"></span>'
                    f'{vmax:.0f} {"%" if col == "prevision" else ""}')
-    legende += ('<span class="trait"></span>contour pointillé : nouvelle province (taux de la province d\'origine)')
+    legende += ('<span class="trait"></span>pointillés : nouvelle province (taux de la province d\'origine)'
+                if not par_region else "")
+    legende += '<span class="epais"></span>limite de région'
     formes, textes = [], []
     for code, geo in carte["provinces"].items():
         if code not in r.index:
             continue
         x = r.loc[code]
-        bulle = (f"{x.province_new} ({x.region_new})\n{NOMS_PRIORITE[code_priorite(x.priorite)]}\n"
-                 f"Indice de risque : {x.IRD:.0f} / 100 (rang {x.rang_IRD} sur 47)\n"
-                 f"Abandon actuel : {x.taux_abandon:.1f} %\n"
-                 f"Abandon prévu : {x.prevision:.1f} % (entre {x.prevision_bas80:.1f} et {x.prevision_haut80:.1f})\n"
-                 f"Élèves susceptibles d'abandonner : {nombre(x.eleves_decrocheurs_prevus)}")
-        actif = code in visibles
-        if code == choisie:
-            trait = 'stroke="#000" stroke-width="2.6"'
-        elif x.scindee:
-            trait = 'stroke="#222" stroke-width="1.3" stroke-dasharray="3,2"'
+        cle = cle_de[code]
+        if par_region:
+            g = table.loc[cle]
+            bulle = (f"Région {cle} ({int(g.provinces)} provinces)\n{NOMS_PRIORITE[g.priorite]}\n"
+                     f"Indice de risque moyen : {g.IRD:.0f} / 100 (rang {g.rang_IRD} sur {len(table)})\n"
+                     f"Abandon actuel : {g.taux_abandon:.1f} %\nAbandon prévu : {g.prevision:.1f} %\n"
+                     f"Provinces P1 / P2 / P3 : {g.P1} / {g.P2} / {g.P3}\n"
+                     f"Élèves susceptibles d'abandonner : {nombre(g.eleves_decrocheurs_prevus)}")
+            trait = 'stroke="#fff" stroke-width="0.3"'
         else:
-            trait = 'stroke="#555" stroke-width="0.5"'
-        formes.append(f'<path d="{geo["path"]}" fill="{couleur[code]}" {trait} opacity="{1 if actif else 0.22}">'
+            bulle = (f"{x.province_new} ({x.region_new})\n{NOMS_PRIORITE[code_priorite(x.priorite)]}\n"
+                     f"Indice de risque : {x.IRD:.0f} / 100 (rang {x.rang_IRD} sur 47)\n"
+                     f"Abandon actuel : {x.taux_abandon:.1f} %\n"
+                     f"Abandon prévu : {x.prevision:.1f} % (entre {x.prevision_bas80:.1f} et {x.prevision_haut80:.1f})\n"
+                     f"Élèves susceptibles d'abandonner : {nombre(x.eleves_decrocheurs_prevus)}")
+            if code == choisie:
+                trait = 'stroke="#000" stroke-width="2.6"'
+            elif x.scindee:
+                trait = 'stroke="#222" stroke-width="1.1" stroke-dasharray="3,2"'
+            else:
+                trait = 'stroke="#666" stroke-width="0.45"'
+        actif = cle in visibles_cles if par_region else code in visibles
+        formes.append(f'<path d="{geo["path"]}" fill="{couleur[cle]}" {trait} opacity="{1 if actif else 0.22}">'
                       f'<title>{bulle}</title></path>')
-        tx, ty, ax, ay, deplace = pos[code]
+    contours = []
+    for nom, geo in carte["regions"].items():
+        choisi = par_region and nom == choisie
+        contours.append(f'<path d="{geo["path"]}" fill="none" stroke="#111" stroke-width="{3 if choisi else 1.5}" '
+                        f'stroke-linejoin="round" pointer-events="none"/>')
+    if par_region:
+        noms_r = {k: k for k in carte["regions"]}
+        pos = positions_regions(tuple(sorted(noms_r.items())))
+        etiquettes = noms_r
+        taille = 12.5
+    else:
+        etiquettes = {k: r.at[k, "province_new"] for k in r.index}
+        pos = positions_noms(tuple(sorted(etiquettes.items())))
+        taille = C.FS
+    for code, (tx, ty, ax, ay, deplace) in pos.items():
         if deplace:
             textes.append(f'<line x1="{ax:.1f}" y1="{ay:.1f}" x2="{tx:.1f}" y2="{ty:.1f}" stroke="#222" '
                           f'stroke-width="0.5"/><circle cx="{ax:.1f}" cy="{ay:.1f}" r="1.3" fill="#222"/>')
-        poids = "700" if code == choisie else "500"
-        textes.append(f'<text x="{tx:.1f}" y="{ty + 3:.1f}" text-anchor="middle" font-size="{C.FS}" '
-                      f'font-weight="{poids}" opacity="{1 if actif else 0.45}">{noms[code]}</text>')
+        if par_region:
+            actif, gras = code in visibles_cles, (code == choisie)
+        else:
+            actif, gras = code in visibles, (code == choisie)
+        textes.append(f'<text x="{tx:.1f}" y="{ty + 3:.1f}" text-anchor="middle" font-size="{taille}" '
+                      f'font-weight="{700 if (gras or par_region) else 600}" opacity="{1 if actif else 0.5}">'
+                      f'{etiquettes[code]}</text>')
     return f"""
 <style>
-  body {{margin:0; font-family: "Source Sans Pro", sans-serif; font-size: 13px; color:#222}}
-  svg text {{fill:#111; stroke:#fff; stroke-width:2.4px; paint-order:stroke; pointer-events:none;
-            font-family: "Source Sans Pro", sans-serif;}}
+  body {{margin:0; font-family: Arial, Helvetica, sans-serif; font-size: 13px; color:#222}}
+  svg text {{fill:#000; stroke:#fff; stroke-width:1.5px; paint-order:stroke; pointer-events:none;
+            font-family: Arial, Helvetica, sans-serif; text-rendering: geometricPrecision;}}
   svg path:hover {{stroke:#000; stroke-width:1.8px}}
   .pt {{display:inline-block; width:12px; height:12px; border:1px solid #888; margin:0 5px 0 14px; vertical-align:-1px}}
   .degrade {{display:inline-block; width:150px; height:11px; vertical-align:middle; margin:0 6px;
             background:linear-gradient(90deg,rgb(255,237,160),rgb(128,0,38))}}
   .trait {{display:inline-block; width:22px; border-top:2px dashed #222; vertical-align:middle; margin:0 6px 0 18px}}
+  .epais {{display:inline-block; width:22px; border-top:3px solid #111; vertical-align:middle; margin:0 6px 0 18px}}
 </style>
-<svg viewBox="0 0 {carte["largeur"]} {carte["hauteur"]}" style="width:100%;max-height:600px">
-{"".join(formes)}{"".join(textes)}</svg>
+<svg viewBox="0 0 {carte["largeur"]} {carte["hauteur"]}" style="width:100%;max-height:640px">
+{"".join(formes)}{"".join(contours)}{"".join(textes)}</svg>
 <div style="margin-top:4px;line-height:1.9">{legende}</div>"""
 
 
-# =============================================================================
-# Page dynamique : prevision et tableau de bord
-# =============================================================================
+def fiche_region(g, resultat, infos):
+    p = g.priorite
+    t, t1 = infos["annee_donnees"], infos["annee_prevue"]
+    lignes = [
+        (f"Indice de risque moyen {M.annee_label(t)}", f"{g.IRD:.0f} / 100 (rang {g.rang_IRD} sur 17)"),
+        (f"Abandon {M.annee_label(t)}", f"{g.taux_abandon:.1f} %"),
+        (f"Abandon prévu {M.annee_label(t1)}", f"{g.prevision:.1f} %"),
+        ("Provinces P1 / P2 / P3", f"{g.P1} / {g.P2} / {g.P3}"),
+        ("Provinces en alerte", f"{g.en_alerte} sur {g.provinces}"),
+        ("Élèves dans le primaire", nombre(g.effectif)),
+        (f"Élèves susceptibles d'abandonner {M.annee_label(t1)}", nombre(g.eleves_decrocheurs_prevus)),
+    ]
+    corps = "".join(f"<tr><td>{a}</td><td>{b}</td></tr>" for a, b in lignes)
+    provs = resultat[resultat.region_new == g.region_new].sort_values("IRD", ascending=False)
+    liste = ", ".join(f"{x.province_new} ({code_priorite(x.priorite)})" for x in provs.itertuples())
+    st.markdown(f'<div class="fiche"><h3>Région {g.region_new}</h3><span class="pastille" '
+                f'style="background:{COULEURS_PRIORITE[p]};color:{"#fff" if p == "P1" else "#222"}">'
+                f'{NOMS_PRIORITE[p]}</span><table>{corps}</table>'
+                f'<p style="font-size:0.82rem;color:#555;margin:10px 0 0 0">Provinces : {liste}.</p></div>',
+                unsafe_allow_html=True)
+
+
+def evolution_regions(infos, regions, resultat, noms):
+    """Abandon observe par region (moyenne ponderee par les effectifs), puis prevision de l'annee suivante."""
+    h = infos["historique"].merge(resultat[["pcode_prov_new", "region_new"]], on="pcode_prov_new")
+    h = h[h.region_new.isin(noms)]
+    h = (h.assign(w=h.effectif_propre.clip(lower=1)).groupby(["region_new", "annee"])
+         .apply(lambda g: np.average(g.taux_abandon, weights=g.w), include_groups=False)
+         .rename("taux_abandon").reset_index())
+    h["periode"] = h.annee.map(M.annee_label)
+    t1 = M.annee_label(infos["annee_prevue"])
+    prev = regions[regions.region_new.isin(noms)][["region_new", "prevision", "prevision_bas80",
+                                                   "prevision_haut80"]].assign(periode=t1)
+    ordre = [M.annee_label(a) for a in sorted(h.annee.unique())] + [t1]
+    x = alt.X("periode:N", sort=ordre, title=None, axis=alt.Axis(labelAngle=0))
+    couleur = alt.Color("region_new:N", title=None, legend=alt.Legend(orient="bottom"))
+    ligne = alt.Chart(h).mark_line(point=True, strokeWidth=2).encode(
+        x=x, y=alt.Y("taux_abandon:Q", title="Taux d'abandon (%)", scale=alt.Scale(zero=True)), color=couleur,
+        tooltip=[alt.Tooltip("region_new", title="Région"), alt.Tooltip("periode", title="Année"),
+                 alt.Tooltip("taux_abandon", title="Abandon (%)", format=".1f")])
+    barre = alt.Chart(prev).mark_rule(strokeWidth=4, opacity=0.35).encode(
+        x=x, y="prevision_bas80:Q", y2="prevision_haut80:Q", color=couleur)
+    point = alt.Chart(prev).mark_point(shape="diamond", size=170, filled=True).encode(
+        x=x, y="prevision:Q", color=couleur,
+        tooltip=[alt.Tooltip("region_new", title="Région"), alt.Tooltip("prevision", title="Abandon prévu (%)", format=".1f")])
+    st.altair_chart((barre + ligne + point).properties(height=360), width="stretch")
+    st.caption("Moyenne régionale pondérée par les effectifs. Le losange est la prévision de l'année suivante ; "
+               "le trait vertical clair est la fourchette à 80 %.")
+
+
 def fiche_province(x, infos):
     p = code_priorite(x.priorite)
     t, t1 = infos["annee_donnees"], infos["annee_prevue"]
@@ -281,80 +392,132 @@ def tableau_dynamique(resultat, infos, visibles_df):
 
 
 def rendu_dynamique(resultat, infos, cle):
-    """Page unique : filtres, chiffres clés, carte, fiche province, classement, évolution, régions."""
+    """Page unique : niveau (provinces ou regions), filtres, chiffres cles, carte, fiche, classement, evolution."""
     t, t1 = infos["annee_donnees"], infos["annee_prevue"]
+    regions_df = agreger_regions(resultat)
 
+    niveau = st.radio("Niveau d'affichage", ["Provinces", "Régions"], horizontal=True, key=f"niv_{cle}",
+                      help="Les régions (17) regroupent les provinces (47) : valeurs moyennes pondérées par les effectifs.")
+    par_region = niveau == "Régions"
     f1, f2, f3 = st.columns([2, 2, 3])
     regions = sorted(resultat.region_new.unique())
     choix_regions = f1.multiselect("Régions", regions, placeholder="Toutes les régions", key=f"reg_{cle}")
-    choix_prio = f2.multiselect("Niveaux de priorité", [NOMS_PRIORITE[p] for p in NOMS_PRIORITE],
-                                placeholder="Tous les niveaux", key=f"prio_{cle}")
+    choix_prio = f2.multiselect("Niveaux de priorité" + (" (régionale)" if par_region else ""),
+                                [NOMS_PRIORITE[p] for p in NOMS_PRIORITE], placeholder="Tous les niveaux",
+                                key=f"prio_{cle}")
     mode = f3.radio("Colorer la carte selon", ["Priorité", f"Abandon prévu {M.annee_label(t1)}",
                                                f"Indice de risque {M.annee_label(t)}"],
                     horizontal=True, key=f"mode_{cle}")
+    inv = {v: k for k, v in NOMS_PRIORITE.items()}
 
     masque = pd.Series(True, index=resultat.index)
     if choix_regions:
         masque &= resultat.region_new.isin(choix_regions)
     if choix_prio:
-        inv = {v: k for k, v in NOMS_PRIORITE.items()}
-        masque &= resultat.priorite.map(code_priorite).isin([inv[c] for c in choix_prio])
+        if par_region:
+            ok = set(regions_df[regions_df.priorite.isin([inv[c] for c in choix_prio])].region_new)
+            masque &= resultat.region_new.isin(ok)
+        else:
+            masque &= resultat.priorite.map(code_priorite).isin([inv[c] for c in choix_prio])
     vis = resultat[masque]
     if vis.empty:
         st.warning("Aucune province ne correspond à ces filtres.")
         return
+    regions_vis = regions_df[regions_df.region_new.isin(set(vis.region_new))]
 
-    # chiffres clés : calculés sur la sélection
+    # chiffres cles : calcules sur la selection
     n = vis.priorite.map(code_priorite).value_counts()
     taux_moyen = np.average(vis.prevision, weights=vis.effectif_propre.clip(lower=1))
     k1, k2, k3, k4 = st.columns(4)
     k1.metric("Provinces en priorité 1", int(n.get("P1", 0)), help="Intervention immédiate recommandée.")
     k2.metric(f"Abandon moyen prévu {M.annee_label(t1)}", f"{taux_moyen:.1f} %",
-              help="Moyenne des provinces sélectionnées, pondérée par le nombre d'élèves.")
+              help="Moyenne de la sélection, pondérée par le nombre d'élèves.")
     k3.metric("Élèves susceptibles d'abandonner", nombre(vis.eleves_decrocheurs_prevus.sum()),
-              help=f"Estimation pour l'année {M.annee_label(t1)}, dans les provinces sélectionnées.")
+              help=f"Estimation pour l'année {M.annee_label(t1)}, dans la sélection.")
     k4.metric("Provinces en alerte", f"{int(vis.signalee_alerte.sum())} sur {len(vis)}",
               help="Provinces où l'abandon risque de dépasser 15 %.")
 
-    gauche, droite = st.columns([5, 3], gap="large")
+    gauche, droite = st.columns([6, 3], gap="large")
     with droite:
-        options = ["Aucune (voir le classement)"] + sorted(vis.province_new)
-        province = st.selectbox("Voir le détail d'une province", options, key=f"prov_{cle}")
-        if province == options[0]:
-            st.markdown(f"**Les 10 provinces les plus exposées**")
-            top = vis.head(10)[["province_new", "priorite", "IRD", "prevision"]].copy()
-            top["priorite"] = top.priorite.map(lambda s: NOMS_PRIORITE[code_priorite(s)])
-            st.dataframe(top.rename(columns={"province_new": "Province", "priorite": "Priorité",
-                                             "IRD": "Indice", "prevision": f"Abandon prévu (%)"}),
-                         hide_index=True, width="stretch",
-                         column_config={"Indice": st.column_config.NumberColumn(format="%.0f"),
-                                        "Abandon prévu (%)": st.column_config.NumberColumn(format="%.1f")})
-            st.caption("Survolez la carte pour lire les chiffres d'une province, ou choisissez-la ci-dessus.")
-            choisie = None
+        if par_region:
+            options = ["Aucune (voir le classement)"] + sorted(regions_vis.region_new)
+            choix = st.selectbox("Voir le détail d'une région", options, key=f"regsel_{cle}")
+            if choix == options[0]:
+                st.markdown("**Les régions les plus exposées**")
+                top = regions_vis.head(10)[["region_new", "priorite", "IRD", "prevision"]].copy()
+                top["priorite"] = top.priorite.map(NOMS_PRIORITE)
+                st.dataframe(top.rename(columns={"region_new": "Région", "priorite": "Priorité", "IRD": "Indice",
+                                                 "prevision": "Abandon prévu (%)"}), hide_index=True, width="stretch",
+                             column_config={"Indice": st.column_config.NumberColumn(format="%.0f"),
+                                            "Abandon prévu (%)": st.column_config.NumberColumn(format="%.1f")})
+                st.caption("Survolez la carte pour lire les chiffres d'une région, ou choisissez-la ci-dessus.")
+                choisie = None
+            else:
+                fiche_region(regions_vis[regions_vis.region_new == choix].iloc[0], resultat, infos)
+                choisie = choix
         else:
-            fiche_province(vis[vis.province_new == province].iloc[0], infos)
-            choisie = vis[vis.province_new == province].pcode_prov_new.iloc[0]
+            options = ["Aucune (voir le classement)"] + sorted(vis.province_new)
+            province = st.selectbox("Voir le détail d'une province", options, key=f"prov_{cle}")
+            if province == options[0]:
+                st.markdown("**Les 10 provinces les plus exposées**")
+                top = vis.head(10)[["province_new", "priorite", "IRD", "prevision"]].copy()
+                top["priorite"] = top.priorite.map(lambda s: NOMS_PRIORITE[code_priorite(s)])
+                st.dataframe(top.rename(columns={"province_new": "Province", "priorite": "Priorité",
+                                                 "IRD": "Indice", "prevision": "Abandon prévu (%)"}),
+                             hide_index=True, width="stretch",
+                             column_config={"Indice": st.column_config.NumberColumn(format="%.0f"),
+                                            "Abandon prévu (%)": st.column_config.NumberColumn(format="%.1f")})
+                st.caption("Survolez la carte pour lire les chiffres d'une province, ou choisissez-la ci-dessus.")
+                choisie = None
+            else:
+                fiche_province(vis[vis.province_new == province].iloc[0], infos)
+                choisie = vis[vis.province_new == province].pcode_prov_new.iloc[0]
     with gauche:
-        afficher_html(carte_svg(resultat, mode, set(vis.pcode_prov_new), choisie), 690)
+        afficher_html(carte_svg(resultat, mode, set(vis.pcode_prov_new), choisie, niveau, regions_df), 760)
 
-    onglets = st.tabs(["Classement des provinces", "Évolution de l'abandon", "Par région"])
+    onglets = st.tabs([f"Classement des {'régions' if par_region else 'provinces'}", "Évolution de l'abandon",
+                       "Élèves par région"])
     with onglets[0]:
-        tableau_dynamique(resultat, infos, vis)
-        st.download_button("Télécharger le tableau (Excel)", vers_excel(resultat), key=f"dl_{cle}",
-                           file_name=f"prevision_{M.annee_label(t1)}.xlsx")
-    with onglets[1]:
-        defaut = [choisie] if choisie else list(vis.head(3).pcode_prov_new)
-        noms = dict(zip(vis.pcode_prov_new, vis.province_new))
-        sel = st.multiselect("Provinces à comparer", list(noms), default=defaut, format_func=noms.get,
-                             max_selections=8, key=f"evo_{cle}_{choisie}")
-        if sel:
-            graphique_evolution(infos, resultat, sel)
+        if par_region:
+            tab = regions_vis[["rang_IRD", "region_new", "priorite", "IRD", "taux_abandon", "prevision",
+                               "provinces", "P1", "P2", "P3", "eleves_decrocheurs_prevus"]].copy()
+            tab["priorite"] = tab.priorite.map(NOMS_PRIORITE)
+            noms_c = {"rang_IRD": "Rang", "region_new": "Région", "priorite": "Priorité", "IRD": "Indice de risque",
+                      "taux_abandon": "Abandon actuel (%)", "prevision": f"Abandon prévu {M.annee_label(t1)} (%)",
+                      "provinces": "Provinces", "P1": "P1", "P2": "P2", "P3": "P3",
+                      "eleves_decrocheurs_prevus": f"Élèves susceptibles d'abandonner {M.annee_label(t1)}"}
+            cfg = {noms_c[c]: st.column_config.NumberColumn(format="%.1f") for c in ("IRD", "taux_abandon", "prevision")}
+            cfg[noms_c["eleves_decrocheurs_prevus"]] = st.column_config.NumberColumn(format="%d")
+            st.dataframe(tab.rename(columns=noms_c), hide_index=True, width="stretch", column_config=cfg)
+            st.caption("Moyennes régionales pondérées par les effectifs. La priorité régionale applique les seuils "
+                       "d'indice (70, 55, 40) à l'indice moyen de la région.")
+            st.download_button("Télécharger le tableau (Excel)", vers_excel(regions_df), key=f"dlr_{cle}",
+                               file_name=f"regions_{M.annee_label(t1)}.xlsx")
         else:
-            st.info("Choisissez au moins une province.")
+            tableau_dynamique(resultat, infos, vis)
+            st.download_button("Télécharger le tableau (Excel)", vers_excel(resultat), key=f"dl_{cle}",
+                               file_name=f"prevision_{M.annee_label(t1)}.xlsx")
+    with onglets[1]:
+        if par_region:
+            defaut = [choisie] if choisie else list(regions_vis.head(3).region_new)
+            sel = st.multiselect("Régions à comparer", list(regions_vis.region_new), default=defaut,
+                                 max_selections=8, key=f"evor_{cle}_{choisie}")
+            if sel:
+                evolution_regions(infos, regions_df, resultat, sel)
+            else:
+                st.info("Choisissez au moins une région.")
+        else:
+            defaut = [choisie] if choisie else list(vis.head(3).pcode_prov_new)
+            noms = dict(zip(vis.pcode_prov_new, vis.province_new))
+            sel = st.multiselect("Provinces à comparer", list(noms), default=defaut, format_func=noms.get,
+                                 max_selections=8, key=f"evo_{cle}_{choisie}")
+            if sel:
+                graphique_evolution(infos, resultat, sel)
+            else:
+                st.info("Choisissez au moins une province.")
     with onglets[2]:
-        reg = (vis.groupby("region_new").agg(eleves=("eleves_decrocheurs_prevus", "sum"),
-                                             provinces=("province_new", "size"))
-               .reset_index().sort_values("eleves", ascending=False))
+        reg = regions_vis[["region_new", "eleves_decrocheurs_prevus", "provinces"]].rename(
+            columns={"eleves_decrocheurs_prevus": "eleves"}).sort_values("eleves", ascending=False)
         graphe = alt.Chart(reg).mark_bar(color=ROUGE).encode(
             y=alt.Y("region_new:N", sort="-x", title=None),
             x=alt.X("eleves:Q", title=f"Élèves susceptibles d'abandonner en {M.annee_label(t1)}"),
